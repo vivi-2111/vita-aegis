@@ -1,0 +1,45 @@
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# Secrets
+.env
+.env.*
+
+# Video files
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# AI model weights
+*.pt
+*.pth
+*.onnx
+
+# Generated reports
+*.csv
+
+# Generated images and diagnostic outputs
+accident_frame_*.jpg
+test_detection.jpg
+tracking_inspection/
+accident_frames/
+
+# Python generated output
+*_output.mp4
+*_analysis.mp4
+*_diagnostic.mp4
+*_tracking.mp4
+
+# Dashboard dependencies and build
+dashboard/node_modules/
+dashboard/dist/
