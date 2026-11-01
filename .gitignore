@@ -43,3 +43,11 @@ accident_frames/
 # Dashboard dependencies and build
 dashboard/node_modules/
 dashboard/dist/
+
+# Generated inspection folders and images
+filtered_detection_inspection/
+inspection_frames/
+multi_track_inspection/
+nms_visual_inspection/
+raw_detection_inspection/
+resolution_*.jpg

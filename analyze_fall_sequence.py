@@ -5,426 +5,599 @@ import math
 import numpy as np
 from ultralytics import YOLO
 
-# --------------------------------------------------
-# 1. FILES AND VIDEO SETTINGS
-# --------------------------------------------------
+
+# ==========================================================
+# 1. CONFIGURATION
+# ==========================================================
 
 VIDEO = "accident_clip.mp4"
+
 OUTPUT = "fall_sequence_analysis.mp4"
 CSV_OUTPUT = "fall_sequence_metrics.csv"
-
-# Approximate rider region in the original video.
-CROP_X1, CROP_Y1 = 450, 180
-CROP_X2, CROP_Y2 = 850, 520
-
-# Approximate rider center in crop coordinates.
-ANCHOR = np.array([230.0, 130.0], dtype=np.float32)
-
-MAX_CENTER_DISTANCE = 60.0
 
 START_TIME = 3.5
 END_TIME = 7.0
 
 CONFIDENCE_THRESHOLD = 0.15
 
-# IMPORTANT:
-# Learn normal posture only before the suspected fall.
 BASELINE_END_TIME = 4.0
 BASELINE_FRAMES = 20
 
-# A detection missing for several frames resets tracking.
 MAX_LOST_FRAMES = 5
 
-# --------------------------------------------------
-# 2. LOAD MODEL AND VIDEO
-# --------------------------------------------------
+# Original video crop coordinates
+CROP_X1, CROP_Y1 = 450, 180
+CROP_X2, CROP_Y2 = 850, 520
 
-model = YOLO("yolov8n-pose.pt")
-cap = cv2.VideoCapture(VIDEO)
+# Rider's approximate position inside the crop
+ANCHOR = np.array([230, 130], dtype=float)
 
-if not cap.isOpened():
-    raise SystemExit(f"Cannot open video: {VIDEO}")
-
-fps = cap.get(cv2.CAP_PROP_FPS)
-
-if not math.isfinite(fps) or fps <= 0:
-    cap.release()
-    raise SystemExit("Invalid video FPS.")
-
-writer = None
-frame_no = 0
-
-previous_center = None
-previous_motion_center = None
-lost_frames = 0
-
-rows = []
-baseline_angles = []
+MAX_CENTER_DISTANCE = 60
 
 
-def midpoint(a, b):
-    return (a + b) / 2.0
+# YOLO COCO-17 body keypoint indices
+KEYPOINT_NAMES = {
+    "left_shoulder": 5,
+    "right_shoulder": 6,
+    "left_hip": 11,
+    "right_hip": 12,
+    "left_knee": 13,
+    "right_knee": 14,
+    "left_ankle": 15,
+    "right_ankle": 16
+}
 
+
+# ==========================================================
+# 2. HELPER FUNCTIONS
+# ==========================================================
 
 def valid_number(value):
     try:
-        return math.isfinite(float(value))
+        return np.isfinite(float(value))
     except (TypeError, ValueError):
         return False
 
 
-try:
-    while True:
-        ok, frame = cap.read()
+def calculate_torso_angle(shoulder_mid, hip_mid):
+    dx = shoulder_mid[0] - hip_mid[0]
+    dy = shoulder_mid[1] - hip_mid[1]
 
-        if not ok:
-            break
+    angle = math.degrees(
+        math.atan2(abs(dx), abs(dy))
+    )
 
-        time_sec = frame_no / fps
+    return angle
 
-        if START_TIME <= time_sec <= END_TIME:
-            h, w = frame.shape[:2]
 
-            xa = max(0, CROP_X1)
-            ya = max(0, CROP_Y1)
-            xb = min(w, CROP_X2)
-            yb = min(h, CROP_Y2)
+def create_empty_keypoint_data():
+    data = {}
 
-            if xb <= xa or yb <= ya:
-                raise SystemExit(
-                    "Invalid crop coordinates. "
-                    "Check CROP_X1/Y1/X2/Y2."
+    for name in KEYPOINT_NAMES:
+        data[f"{name}_x"] = ""
+        data[f"{name}_y"] = ""
+        data[f"{name}_conf"] = ""
+
+    return data
+
+
+def extract_keypoint_data(kp, confs):
+    data = create_empty_keypoint_data()
+
+    for name, idx in KEYPOINT_NAMES.items():
+
+        if idx >= len(kp) or idx >= len(confs):
+            continue
+
+        x, y = kp[idx]
+        confidence = confs[idx]
+
+        if (
+            valid_number(x)
+            and valid_number(y)
+            and valid_number(confidence)
+            and confidence >= CONFIDENCE_THRESHOLD
+        ):
+            data[f"{name}_x"] = round(float(x), 2)
+            data[f"{name}_y"] = round(float(y), 2)
+            data[f"{name}_conf"] = round(float(confidence), 3)
+
+    return data
+
+
+# ==========================================================
+# 3. LOAD YOLO POSE MODEL
+# ==========================================================
+
+print("Loading YOLOv8 Pose model...")
+
+model = YOLO("yolov8n-pose.pt")
+
+
+# ==========================================================
+# 4. OPEN VIDEO
+# ==========================================================
+
+cap = cv2.VideoCapture(VIDEO)
+
+if not cap.isOpened():
+    raise RuntimeError(
+        f"Could not open input video: {VIDEO}"
+    )
+
+fps = cap.get(cv2.CAP_PROP_FPS)
+
+if not valid_number(fps) or fps <= 0:
+    cap.release()
+    raise RuntimeError("Invalid video FPS.")
+
+total_frames = int(
+    cap.get(cv2.CAP_PROP_FRAME_COUNT)
+)
+
+print(f"Video FPS: {fps}")
+print(f"Total frames: {total_frames}")
+
+
+# ==========================================================
+# 5. CREATE OUTPUT VIDEO
+# ==========================================================
+
+crop_width = CROP_X2 - CROP_X1
+crop_height = CROP_Y2 - CROP_Y1
+
+fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+
+out = cv2.VideoWriter(
+    OUTPUT,
+    fourcc,
+    fps,
+    (crop_width, crop_height)
+)
+
+if not out.isOpened():
+    cap.release()
+    raise RuntimeError(
+        "Could not create output video."
+    )
+
+
+# ==========================================================
+# 6. INITIALIZE ANALYSIS VARIABLES
+# ==========================================================
+
+rows = []
+
+baseline_angles = []
+
+previous_center = None
+
+last_center_for_movement = None
+
+lost_frames = 0
+
+frames_processed = 0
+
+valid_pose_frames = 0
+
+
+# ==========================================================
+# 7. PROCESS VIDEO
+# ==========================================================
+
+print("\nStarting fall-sequence analysis...")
+
+while True:
+
+    ret, frame = cap.read()
+
+    if not ret:
+        break
+
+    frame_number = int(
+        cap.get(cv2.CAP_PROP_POS_FRAMES)
+    ) - 1
+
+    time_sec = frame_number / fps
+
+    # Process only the required time window
+    if time_sec < START_TIME:
+        continue
+
+    if time_sec > END_TIME:
+        break
+
+    # ------------------------------------------------------
+    # Extract rider's region
+    # ------------------------------------------------------
+
+    crop = frame[
+        CROP_Y1:CROP_Y2,
+        CROP_X1:CROP_X2
+    ].copy()
+
+    if crop.shape[:2] != (crop_height, crop_width):
+        print("Warning: Invalid crop dimensions.")
+        continue
+
+    frames_processed += 1
+
+    # ------------------------------------------------------
+    # Initialize frame measurements
+    # ------------------------------------------------------
+
+    detected = 0
+
+    center_x = ""
+    center_y = ""
+
+    box_width = ""
+    box_height = ""
+
+    aspect_ratio = ""
+
+    torso_angle = ""
+    baseline_angle = ""
+    angle_change = ""
+
+    center_displacement = ""
+
+    posture_marker = 0
+    keypoints_valid = 0
+
+    keypoint_data = create_empty_keypoint_data()
+
+    # ------------------------------------------------------
+    # Run YOLOv8 Pose
+    # ------------------------------------------------------
+
+    results = model.predict(
+        crop,
+        conf=CONFIDENCE_THRESHOLD,
+        imgsz=640,
+        verbose=False
+    )
+
+    result = results[0]
+
+    if (
+        result.boxes is not None
+        and result.keypoints is not None
+        and len(result.boxes) > 0
+    ):
+
+        boxes = result.boxes.xyxy.cpu().numpy()
+
+        keypoints = result.keypoints.xy.cpu().numpy()
+
+        if result.keypoints.conf is not None:
+            keypoint_confidences = (
+                result.keypoints.conf.cpu().numpy()
+            )
+        else:
+            keypoint_confidences = np.ones(
+                (len(keypoints), len(keypoints[0]))
+            )
+
+        # --------------------------------------------------
+        # Select the detection closest to the rider
+        # --------------------------------------------------
+
+        candidates = []
+
+        for i, box in enumerate(boxes):
+
+            x1, y1, x2, y2 = box
+
+            cx = (x1 + x2) / 2
+            cy = (y1 + y2) / 2
+
+            center = np.array(
+                [cx, cy],
+                dtype=float
+            )
+
+            if previous_center is not None:
+
+                distance = np.linalg.norm(
+                    center - previous_center
                 )
-
-            crop = frame[ya:yb, xa:xb].copy()
-
-            result = model.predict(
-                crop,
-                conf=CONFIDENCE_THRESHOLD,
-                imgsz=640,
-                verbose=False
-            )[0]
-
-            chosen = None
-            center = None
-            motion = None
-
-            # --------------------------------------------------
-            # 3. DETECT AND TRACK THE RIDER
-            # --------------------------------------------------
-
-            if (
-                result.boxes is not None
-                and result.keypoints is not None
-                and len(result.boxes) > 0
-            ):
-                boxes = result.boxes.xyxy.cpu().numpy()
-                keypoints = result.keypoints.xy.cpu().numpy()
-
-                if result.keypoints.conf is not None:
-                    kp_conf = (
-                        result.keypoints.conf.cpu().numpy()
-                    )
-                else:
-                    kp_conf = np.ones(keypoints.shape[:2])
-
-                centers = np.column_stack((
-                    (boxes[:, 0] + boxes[:, 2]) / 2.0,
-                    (boxes[:, 1] + boxes[:, 3]) / 2.0
-                )).astype(np.float32)
-
-                reference = (
-                    previous_center
-                    if previous_center is not None
-                    else ANCHOR
-                )
-
-                distances = np.linalg.norm(
-                    centers - reference,
-                    axis=1
-                )
-
-                best = int(np.argmin(distances))
-
-                # Accept only detections near the tracked position.
-                if distances[best] <= MAX_CENTER_DISTANCE:
-                    chosen = best
-                    center = centers[best].copy()
-                    lost_frames = 0
-                else:
-                    lost_frames += 1
 
             else:
-                lost_frames += 1
 
-            # Reset stale tracking after repeated missing detections.
-            if lost_frames > MAX_LOST_FRAMES:
-                previous_center = None
-                previous_motion_center = None
+                distance = np.linalg.norm(
+                    center - ANCHOR
+                )
+
+            candidates.append(
+                (distance, i, center)
+            )
+
+        candidates.sort(
+            key=lambda item: item[0]
+        )
+
+        best_distance, best_index, best_center = candidates[0]
+
+        # --------------------------------------------------
+        # Accept detection only within tracking distance
+        # --------------------------------------------------
+
+        if best_distance <= MAX_CENTER_DISTANCE:
+
+            detected = 1
+
+            lost_frames = 0
+
+            previous_center = best_center.copy()
+
+            x1, y1, x2, y2 = boxes[best_index]
+
+            kp = keypoints[best_index]
+
+            confs = keypoint_confidences[best_index]
+
+            # Bounding box measurements
+            center_x = float(best_center[0])
+            center_y = float(best_center[1])
+
+            box_width = float(x2 - x1)
+            box_height = float(y2 - y1)
+
+            if box_height > 0:
+                aspect_ratio = box_width / box_height
 
             # --------------------------------------------------
-            # 4. ANALYZE BODY POSTURE
+            # Extract all 8 body keypoints
             # --------------------------------------------------
 
-            if chosen is not None:
-                box = boxes[chosen]
-                kp = keypoints[chosen]
-                confs = kp_conf[chosen]
+            keypoint_data = extract_keypoint_data(
+                kp,
+                confs
+            )
 
-                # COCO keypoints:
-                # 5, 6 = shoulders
-                # 11, 12 = hips
-                needed = [5, 6, 11, 12]
+            # --------------------------------------------------
+            # Validate torso keypoints
+            # --------------------------------------------------
 
-                valid = all(
-                    np.isfinite(kp[i]).all()
-                    and valid_number(confs[i])
-                    and confs[i] >= CONFIDENCE_THRESHOLD
-                    for i in needed
-                )
+            needed = [5, 6, 11, 12]
 
-                x1, y1, x2, y2 = box
+            valid = True
 
-                box_width = float(x2 - x1)
-                box_height = float(y2 - y1)
+            for idx in needed:
 
-                aspect_ratio = (
-                    box_width / box_height
-                    if box_height > 0
-                    else 0.0
-                )
+                if idx >= len(kp) or idx >= len(confs):
+                    valid = False
+                    break
 
-                torso_angle = None
-                shoulder_mid = None
-                hip_mid = None
-
-                if valid:
-                    shoulder_mid = midpoint(kp[5], kp[6])
-                    hip_mid = midpoint(kp[11], kp[12])
-
-                    dx = float(
-                        shoulder_mid[0] - hip_mid[0]
-                    )
-                    dy = float(
-                        shoulder_mid[1] - hip_mid[1]
-                    )
-
-                    # 0 degrees = vertical torso.
-                    # 90 degrees = horizontal torso.
-                    torso_angle = math.degrees(
-                        math.atan2(
-                            abs(dx),
-                            abs(dy) + 1e-6
-                        )
-                    )
-
-                    # IMPORTANT FIX:
-                    # Build the baseline only before 4.0 seconds.
-                    # Do not let the suspected fall change it.
-                    if (
-                        time_sec < BASELINE_END_TIME
-                        and len(baseline_angles) < BASELINE_FRAMES
-                    ):
-                        baseline_angles.append(torso_angle)
-
-                baseline = (
-                    float(np.median(baseline_angles))
-                    if baseline_angles
-                    else None
-                )
-
-                angle_change = (
-                    torso_angle - baseline
-                    if (
-                        torso_angle is not None
-                        and baseline is not None
-                    )
-                    else None
-                )
-
-                # --------------------------------------------------
-                # 5. CALCULATE MOVEMENT BEFORE UPDATING POSITION
-                # --------------------------------------------------
-
-                if (
-                    previous_motion_center is not None
-                    and np.isfinite(center).all()
+                if not (
+                    np.isfinite(kp[idx]).all()
+                    and valid_number(confs[idx])
+                    and confs[idx] >= CONFIDENCE_THRESHOLD
                 ):
-                    motion = math.hypot(
-                        float(center[0])
-                        - float(previous_motion_center[0]),
-                        float(center[1])
-                        - float(previous_motion_center[1])
-                    )
+                    valid = False
+                    break
 
-                # Update positions only after measuring movement.
-                previous_center = center.copy()
-                previous_motion_center = center.copy()
+            # --------------------------------------------------
+            # Calculate torso posture
+            # --------------------------------------------------
 
-                # --------------------------------------------------
-                # 6. PRELIMINARY POSTURE-CHANGE MARKER
-                # --------------------------------------------------
+            if valid:
 
-                posture_change = (
-                    torso_angle is not None
-                    and angle_change is not None
-                    and torso_angle >= 45
-                    and angle_change >= 25
+                keypoints_valid = 1
+
+                valid_pose_frames += 1
+
+                shoulder_mid = (
+                    kp[5] + kp[6]
+                ) / 2
+
+                hip_mid = (
+                    kp[11] + kp[12]
+                ) / 2
+
+                torso_angle = calculate_torso_angle(
+                    shoulder_mid,
+                    hip_mid
                 )
 
-                # --------------------------------------------------
-                # 7. DRAW DIAGNOSTIC ANNOTATIONS
-                # --------------------------------------------------
+                # Collect baseline posture samples
+                if (
+                    time_sec < BASELINE_END_TIME
+                    and len(baseline_angles) < BASELINE_FRAMES
+                ):
+                    baseline_angles.append(
+                        torso_angle
+                    )
 
-                x1i, y1i, x2i, y2i = map(int, box)
+                # Calculate angle change
+                if len(baseline_angles) > 0:
 
-                cv2.rectangle(
+                    baseline_angle = float(
+                        np.median(baseline_angles)
+                    )
+
+                    angle_change = abs(
+                        torso_angle - baseline_angle
+                    )
+
+                    # Existing posture signal
+                    if (
+                        torso_angle >= 45
+                        and angle_change >= 25
+                    ):
+                        posture_marker = 1
+
+                # Draw torso line
+                shoulder_point = tuple(
+                    np.array(shoulder_mid, dtype=int)
+                )
+
+                hip_point = tuple(
+                    np.array(hip_mid, dtype=int)
+                )
+
+                cv2.line(
                     crop,
-                    (x1i, y1i),
-                    (x2i, y2i),
+                    shoulder_point,
+                    hip_point,
                     (0, 255, 255),
                     2
                 )
 
-                for idx in needed:
-                    px, py = map(int, kp[idx])
-
-                    cv2.circle(
-                        crop,
-                        (px, py),
-                        4,
-                        (0, 255, 0),
-                        -1
-                    )
-
-                if valid:
-                    cv2.line(
-                        crop,
-                        tuple(map(int, shoulder_mid)),
-                        tuple(map(int, hip_mid)),
-                        (255, 0, 255),
-                        3
-                    )
-
-                angle_text = (
-                    f"{torso_angle:.1f} deg"
-                    if torso_angle is not None
-                    else "angle unavailable"
-                )
-
-                label = (
-                    f"Posture: {angle_text}"
-                    + (" | CHECK" if posture_change else "")
-                )
-
-                cv2.putText(
-                    crop,
-                    label,
-                    (10, 25),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.55,
-                    (255, 255, 255),
-                    2
-                )
-
-                rows.append({
-                    "time_sec": round(time_sec, 3),
-                    "frame": frame_no,
-                    "detected": 1,
-                    "center_x": round(float(center[0]), 2),
-                    "center_y": round(float(center[1]), 2),
-                    "box_width": round(box_width, 2),
-                    "box_height": round(box_height, 2),
-                    "aspect_ratio": round(aspect_ratio, 3),
-                    "torso_angle_deg": (
-                        round(torso_angle, 2)
-                        if torso_angle is not None
-                        else ""
-                    ),
-                    "baseline_angle_deg": (
-                        round(baseline, 2)
-                        if baseline is not None
-                        else ""
-                    ),
-                    "angle_change_deg": (
-                        round(angle_change, 2)
-                        if angle_change is not None
-                        else ""
-                    ),
-                    "center_displacement_px": (
-                        round(motion, 2)
-                        if motion is not None
-                        else ""
-                    ),
-                    "posture_change_marker": int(posture_change),
-                    "keypoints_valid": int(valid)
-                })
-
-            else:
-                # Record missing detections without inventing values.
-                rows.append({
-                    "time_sec": round(time_sec, 3),
-                    "frame": frame_no,
-                    "detected": 0,
-                    "center_x": "",
-                    "center_y": "",
-                    "box_width": "",
-                    "box_height": "",
-                    "aspect_ratio": "",
-                    "torso_angle_deg": "",
-                    "baseline_angle_deg": (
-                        round(float(np.median(baseline_angles)), 2)
-                        if baseline_angles
-                        else ""
-                    ),
-                    "angle_change_deg": "",
-                    "center_displacement_px": "",
-                    "posture_change_marker": 0,
-                    "keypoints_valid": 0
-                })
-
             # --------------------------------------------------
-            # 8. CREATE OUTPUT VIDEO
+            # Calculate center displacement
             # --------------------------------------------------
 
-            if writer is None:
-                ch, cw = crop.shape[:2]
+            current_center = np.array(
+                [center_x, center_y],
+                dtype=float
+            )
 
-                writer = cv2.VideoWriter(
-                    OUTPUT,
-                    cv2.VideoWriter_fourcc(*"mp4v"),
-                    fps,
-                    (cw, ch)
+            if last_center_for_movement is not None:
+
+                center_displacement = float(
+                    np.linalg.norm(
+                        current_center - last_center_for_movement
+                    )
                 )
 
-                if not writer.isOpened():
-                    raise SystemExit(
-                        f"Cannot create output video: {OUTPUT}"
-                    )
+            last_center_for_movement = current_center.copy()
 
-            cv2.putText(
+            # --------------------------------------------------
+            # Draw bounding box
+            # --------------------------------------------------
+
+            cv2.rectangle(
                 crop,
-                f"Clip time: {time_sec:.2f}s",
-                (10, crop.shape[0] - 12),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.55,
-                (255, 255, 255),
+                (int(x1), int(y1)),
+                (int(x2), int(y2)),
+                (0, 255, 0),
                 2
             )
 
-            writer.write(crop)
+            # --------------------------------------------------
+            # Draw body keypoints
+            # --------------------------------------------------
 
-        frame_no += 1
+            for idx in KEYPOINT_NAMES.values():
 
-finally:
-    cap.release()
+                if idx >= len(kp) or idx >= len(confs):
+                    continue
 
-    if writer is not None:
-        writer.release()
+                if (
+                    valid_number(confs[idx])
+                    and confs[idx] >= CONFIDENCE_THRESHOLD
+                    and np.isfinite(kp[idx]).all()
+                ):
 
-# --------------------------------------------------
-# 9. SAVE CSV METRICS
-# --------------------------------------------------
+                    point = tuple(
+                        np.array(kp[idx], dtype=int)
+                    )
+
+                    cv2.circle(
+                        crop,
+                        point,
+                        4,
+                        (0, 0, 255),
+                        -1
+                    )
+
+        else:
+
+            lost_frames += 1
+
+    else:
+
+        lost_frames += 1
+
+    # ------------------------------------------------------
+    # Reset tracking after too many missing frames
+    # ------------------------------------------------------
+
+    if lost_frames > MAX_LOST_FRAMES:
+
+        previous_center = None
+
+        last_center_for_movement = None
+
+    # ------------------------------------------------------
+    # Display information on video
+    # ------------------------------------------------------
+
+    cv2.putText(
+        crop,
+        f"Time: {time_sec:.2f}s",
+        (10, 25),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        (255, 255, 255),
+        2
+    )
+
+    if torso_angle != "":
+
+        cv2.putText(
+            crop,
+            f"Torso Angle: {torso_angle:.1f}",
+            (10, 50),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (255, 255, 255),
+            2
+        )
+
+    if posture_marker == 1:
+
+        cv2.putText(
+            crop,
+            "POSTURE CHANGE",
+            (10, 80),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (0, 0, 255),
+            2
+        )
+
+    # ------------------------------------------------------
+    # Save measurements for this frame
+    # ------------------------------------------------------
+
+    row = {
+        "time_sec": round(time_sec, 3),
+        "frame": frame_number,
+        "detected": detected,
+        "center_x": center_x,
+        "center_y": center_y,
+        "box_width": box_width,
+        "box_height": box_height,
+        "aspect_ratio": aspect_ratio,
+        "torso_angle_deg": torso_angle,
+        "baseline_angle_deg": baseline_angle,
+        "angle_change_deg": angle_change,
+        "center_displacement_px": center_displacement,
+        "posture_change_marker": posture_marker,
+        "keypoints_valid": keypoints_valid,
+        **keypoint_data
+    }
+
+    rows.append(row)
+
+    # Write annotated frame
+    out.write(crop)
+
+
+# ==========================================================
+# 8. RELEASE VIDEO RESOURCES
+# ==========================================================
+
+cap.release()
+out.release()
+
+
+# ==========================================================
+# 9. SAVE CSV FILE
+# ==========================================================
 
 columns = [
     "time_sec",
@@ -443,51 +616,55 @@ columns = [
     "keypoints_valid"
 ]
 
+for name in KEYPOINT_NAMES:
+
+    columns.extend([
+        f"{name}_x",
+        f"{name}_y",
+        f"{name}_conf"
+    ])
+
+
 with open(
     CSV_OUTPUT,
     "w",
-    newline="",
-    encoding="utf-8"
-) as f:
-    output = csv.DictWriter(f, fieldnames=columns)
-    output.writeheader()
-    output.writerows(rows)
+    newline=""
+) as file:
 
-# --------------------------------------------------
-# 10. DISPLAY SUMMARY
-# --------------------------------------------------
+    writer = csv.DictWriter(
+        file,
+        fieldnames=columns
+    )
 
-print("\nTemporal analysis complete.")
-print("Video:", OUTPUT)
-print("Metrics:", CSV_OUTPUT)
-print("Frames analyzed:", len(rows))
+    writer.writeheader()
 
-print(
-    "Frames with selected-person detections:",
-    sum(r["detected"] for r in rows)
-)
+    writer.writerows(rows)
 
-print(
-    "Valid keypoint frames:",
-    sum(r["keypoints_valid"] for r in rows)
-)
 
-print(
-    "Baseline samples collected:",
-    len(baseline_angles)
-)
+# ==========================================================
+# 10. FINAL REPORT
+# ==========================================================
 
-print(
-    "Fixed baseline end time:",
-    BASELINE_END_TIME,
-    "seconds"
-)
+print("\n" + "=" * 50)
 
-print(
-    "Preliminary posture-change markers:",
-    sum(r["posture_change_marker"] for r in rows)
-)
+print("FALL-SEQUENCE ANALYSIS COMPLETED")
 
-print(
-    "Reminder: posture markers are not confirmed accident events."
-)
+print("=" * 50)
+
+print(f"Input video: {VIDEO}")
+
+print(f"Annotated video: {OUTPUT}")
+
+print(f"Metrics CSV: {CSV_OUTPUT}")
+
+print(f"Frames processed: {frames_processed}")
+
+print(f"Frames with rider detection: {sum(row['detected'] for row in rows)}")
+
+print(f"Frames with valid torso keypoints: {valid_pose_frames}")
+
+print(f"Baseline samples collected: {len(baseline_angles)}")
+
+print("=" * 50)
+
+print("\nAll 8 body keypoints have been saved.")
