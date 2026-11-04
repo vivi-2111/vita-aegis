@@ -768,3 +768,54 @@ footer {
     flex-direction: column;
   }
 }
+
+/* ACCIDENT VIDEO PLAYER */
+
+.camera-video {
+  width: 100%;
+  height: 340px;
+  background: #05080e;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  border-radius: 8px;
+}
+
+.camera-video video {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  display: block;
+}
+
+.video-indicator {
+  color: #fbbf24;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+}
+
+.standalone-video {
+  height: min(65vh, 600px);
+  margin-top: 15px;
+}
+
+.camera-footer { 
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+
+/* VIDEO RESPONSIVENESS */
+
+@media (max-width: 768px) {
+  .camera-video {
+    height: 240px;
+  }
+
+  .standalone-video {
+    height: 300px;
+  }
+}
